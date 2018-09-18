@@ -51,8 +51,9 @@ vec3 decodeDataForIBL(const vec4 data) {
 // IBL prefiltered DFG term implementations
 //------------------------------------------------------------------------------
 
-vec2 PrefilteredDFG_LUT(float roughness, float NoV) {
-    return textureLod(light_iblDFG, vec2(NoV, roughness), 0.0).rg;
+vec2 PrefilteredDFG_LUT(float coord, float NoV) {
+    // coord = sqrt(linear_roughness), which is the mapping used by cmgen.
+    return textureLod(light_iblDFG, vec2(NoV, coord), 0.0).rg;
 }
 
 #if CLOTH_DFG == CLOTH_DFG_ASHIKHMIN
@@ -115,6 +116,7 @@ vec2 prefilteredDFG(float roughness, float NoV) {
     #endif
 #else
     #if IBL_PREFILTERED_DFG == IBL_PREFILTERED_DFG_LUT
+        // PrefilteredDFG_LUT() takes a coordinate, which is sqrt(linear_roughness) = roughness
         return PrefilteredDFG_LUT(roughness, NoV);
     #endif
 #endif
@@ -157,7 +159,7 @@ vec3 diffuseIrradiance(const vec3 n) {
 //------------------------------------------------------------------------------
 
 vec3 specularIrradiance(const vec3 r, float roughness) {
-    // lod = nb_mips * sqrt(linear_roughness)
+    // lod = lod_count * sqrt(linear_roughness), which is the mapping used by cmgen
     // where linear_roughness = roughness^2
     // using all the mip levels requires seamless cubemap sampling
     float lod = IBL_MAX_MIP_LEVEL * roughness;
@@ -165,7 +167,7 @@ vec3 specularIrradiance(const vec3 r, float roughness) {
 }
 
 vec3 specularIrradiance(const vec3 r, float roughness, float offset) {
-    float lod = IBL_MAX_MIP_LEVEL * roughness;
+    float lod = IBL_MAX_MIP_LEVEL * roughness * roughness;
     return decodeDataForIBL(textureLod(light_iblSpecular, r, lod + offset));
 }
 
@@ -242,20 +244,20 @@ vec3 isEvaluateIBL(const PixelParams pixel, vec3 n, vec3 v, float NoV) {
     const float K = 4.0;
 
     // IMPORTANT: Keep numSample = 1 << numSampleBits
-    const uint numSamples = IBL_INTEGRATION_IMPORTANCE_SAMPLING_COUNT;
+    const uint numSamples = uint(IBL_INTEGRATION_IMPORTANCE_SAMPLING_COUNT);
     const uint numSampleBits = uint(log2(float(numSamples)));
     const float invNumSamples = 1.0 / float(numSamples);
 
     vec3 indirectSpecular = vec3(0.0);
-    for (uint i = 0; i < numSamples; i++) {
+    for (uint i = 0u; i < numSamples; i++) {
         // Compute Hammersley sequence
         // TODO: these should come from uniforms
         // TODO: we should do this with logical bit operations
         uint t = i;
-        uint bits = 0;
-        for (uint j = 0; j < numSampleBits; j++) {
-            bits = bits * 2 + (t - (2 * (t / 2)));
-            t /= 2;
+        uint bits = 0u;
+        for (uint j = 0u; j < numSampleBits; j++) {
+            bits = bits * 2u + (t - (2u * (t / 2u)));
+            t /= 2u;
         }
         vec2 u = vec2(float(i), float(bits)) * invNumSamples;
 

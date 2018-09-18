@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <image/ImageOps.h>
 #include <image/ImageSampler.h>
 #include <image/LinearImage.h>
 
@@ -36,6 +37,7 @@ static bool g_formatSpecified = false;
 static bool g_createGallery = false;
 static string g_compression = "";
 static Filter g_filter = Filter::DEFAULT;
+static bool g_stripAlpha = false;
 
 static const char* USAGE = R"TXT(
 MIPGEN generates mipmaps for an image down to the 1x1 level.
@@ -58,6 +60,8 @@ Options:
        specify output file format, inferred from output pattern if omitted
    --kernel=[box|nearest|hermite|gaussian|normals|mitchell|lanczos|min], -k [filter]
        specify filter kernel type (defaults to LANCZOS)
+   --strip-alpha
+       ignore the alpha component of the input image
    --compression=COMPRESSION, -c COMPRESSION
        format specific compression:
            PNG: Ignored
@@ -106,7 +110,7 @@ static void license() {
 }
 
 static int handleArguments(int argc, char* argv[]) {
-    static constexpr const char* OPTSTR = "hlgf:c:k:";
+    static constexpr const char* OPTSTR = "hlgf:c:k:s";
     static const struct option OPTIONS[] = {
             { "help",                 no_argument, 0, 'h' },
             { "license",              no_argument, 0, 'l' },
@@ -114,6 +118,7 @@ static int handleArguments(int argc, char* argv[]) {
             { "format",         required_argument, 0, 'f' },
             { "compression",    required_argument, 0, 'c' },
             { "kernel",         required_argument, 0, 'k' },
+            { "strip-alpha",          no_argument, 0, 's' },
             { 0, 0, 0, 0 }  // termination of the option list
     };
 
@@ -141,6 +146,9 @@ static int handleArguments(int argc, char* argv[]) {
                 }
                 break;
             }
+            case 's':
+                g_stripAlpha = true;
+                break;
             case 'f':
                 if (arg == "png") {
                     g_format = ImageEncoder::Format::PNG;
@@ -195,7 +203,13 @@ int main(int argc, char* argv[]) {
     LinearImage sourceImage = ImageDecoder::decode(inputStream, inputPath.getPath());
     if (!sourceImage.isValid()) {
         cerr << "Unable to open image: " << inputPath.getPath() << endl;
-        exit(1);
+        return 1;
+    }
+    if (g_stripAlpha && sourceImage.getChannels() == 4) {
+        auto r = extractChannel(sourceImage, 0);
+        auto g = extractChannel(sourceImage, 1);
+        auto b = extractChannel(sourceImage, 2);
+        sourceImage = combineChannels({r, g, b});
     }
 
     puts("Generating miplevels...");
@@ -210,16 +224,20 @@ int main(int argc, char* argv[]) {
         int result = snprintf(path, sizeof(path), outputPattern.c_str(), mip++);
         if (result < 0 || result >= sizeof(path)) {
             cerr << "Output pattern is too long." << endl;
-            exit(1);
+            return 1;
         }
         ofstream outputStream(path, ios::binary | ios::trunc);
         if (!outputStream) {
             cerr << "The output file cannot be opened: " << path << endl;
         } else {
-            ImageEncoder::encode(outputStream, g_format, image, g_compression, path);
+            if (!ImageEncoder::encode(outputStream, g_format, image, g_compression, path)) {
+                cerr << "An error occurred while encoding the image." << endl;
+                return 1;
+            }
             outputStream.close();
             if (!outputStream) {
                 cerr << "An error occurred while writing the output file: " << path << endl;
+                return 1;
             }
         }
     }
@@ -236,7 +254,7 @@ int main(int argc, char* argv[]) {
         int result = snprintf(tag, sizeof(tag), pattern, inputPath.c_str(), width, height);
         if (result < 0 || result >= sizeof(tag)) {
             cerr << "Output pattern is too long." << endl;
-            exit(1);
+            return 1;
         }
         html << tag << std::endl;
         for (auto image: miplevels) {
@@ -244,7 +262,7 @@ int main(int argc, char* argv[]) {
             result = snprintf(tag, sizeof(tag), pattern, path, width, height);
             if (result < 0 || result >= sizeof(tag)) {
                 cerr << "Output pattern is too long." << endl;
-                exit(1);
+                return 1;
             }
             html << tag << std::endl;
         }
