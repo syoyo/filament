@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#include <image/ColorTransform.h>
 #include <image/ImageOps.h>
 #include <image/ImageSampler.h>
+#include <image/KtxBundle.h>
 #include <image/LinearImage.h>
 
 #include <imageio/ImageDecoder.h>
@@ -38,13 +40,18 @@ static bool g_createGallery = false;
 static string g_compression = "";
 static Filter g_filter = Filter::DEFAULT;
 static bool g_stripAlpha = false;
+static bool g_grayscale = false;
+static bool g_ktxContainer = false;
 
 static const char* USAGE = R"TXT(
 MIPGEN generates mipmaps for an image down to the 1x1 level.
 
-Output filenames are generated using the specified printf pattern.
-For example, "mip%2d.png" would generate mip01.png, mip02.png, etc.
-Note that miplevel 0 is not generated since it is the original image.
+The <output_pattern> argument is a printf-style pattern.
+For example, "mip%2d.png" generates mip01.png, mip02.png, etc.
+Miplevel 0 is not generated since it is the original image.
+
+If the output format is a container format like KTX, then
+<output_pattern> is simply a filename.
 
 Usage:
     MIPGEN [options] <input_file> <output_pattern>
@@ -54,12 +61,14 @@ Options:
        print this message
    --license
        print copyright and license information
-   --gallery, -g
-       generate HTML gallery for review purposes (mipmap.html)
-   --format=[exr|hdr|rgbm|psd|png|dds], -f [exr|hdr|rgbm|psd|png|dds]
+   --page, -p
+       generate HTML page for review purposes (mipmap.html)
+   --grayscale, -g
+       create a single-channel image and do not perform gamma correction
+   --format=[exr|hdr|rgbm|psd|png|dds|ktx], -f [exr|hdr|rgbm|psd|png|dds|ktx]
        specify output file format, inferred from output pattern if omitted
    --kernel=[box|nearest|hermite|gaussian|normals|mitchell|lanczos|min], -k [filter]
-       specify filter kernel type (defaults to LANCZOS)
+       specify filter kernel type (defaults to lanczos)
    --strip-alpha
        ignore the alpha component of the input image
    --compression=COMPRESSION, -c COMPRESSION
@@ -110,11 +119,12 @@ static void license() {
 }
 
 static int handleArguments(int argc, char* argv[]) {
-    static constexpr const char* OPTSTR = "hlgf:c:k:s";
+    static constexpr const char* OPTSTR = "hlgpf:c:k:s";
     static const struct option OPTIONS[] = {
             { "help",                 no_argument, 0, 'h' },
             { "license",              no_argument, 0, 'l' },
-            { "gallery",              no_argument, 0, 'g' },
+            { "grayscale",            no_argument, 0, 'g' },
+            { "page",                 no_argument, 0, 'p' },
             { "format",         required_argument, 0, 'f' },
             { "compression",    required_argument, 0, 'c' },
             { "kernel",         required_argument, 0, 'k' },
@@ -136,6 +146,9 @@ static int handleArguments(int argc, char* argv[]) {
                 license();
                 exit(0);
             case 'g':
+                g_grayscale = true;
+                break;
+            case 'p':
                 g_createGallery = true;
                 break;
             case 'k': {
@@ -174,6 +187,10 @@ static int handleArguments(int argc, char* argv[]) {
                     g_format = ImageEncoder::Format::DDS_LINEAR;
                     g_formatSpecified = true;
                 }
+                if (arg == "ktx") {
+                    g_ktxContainer = true;
+                    g_formatSpecified = true;
+                }
                 break;
             case 'c':
                 g_compression = arg;
@@ -193,14 +210,18 @@ int main(int argc, char* argv[]) {
     }
     Path inputPath(argv[optionIndex++]);
     string outputPattern(argv[optionIndex]);
-    if (!g_formatSpecified) {
-        constexpr bool forceLinear = true;
+    if (Path(outputPattern).getExtension() == "ktx") {
+        g_ktxContainer = true;
+        g_formatSpecified = true;
+    } else if (!g_formatSpecified) {
+        const bool forceLinear = !g_grayscale;
         g_format = ImageEncoder::chooseFormat(outputPattern, forceLinear);
     }
 
     puts("Reading image...");
     ifstream inputStream(inputPath.getPath(), ios::binary);
-    LinearImage sourceImage = ImageDecoder::decode(inputStream, inputPath.getPath());
+    LinearImage sourceImage = ImageDecoder::decode(inputStream, inputPath.getPath(),
+            ImageDecoder::ColorSpace::SRGB);
     if (!sourceImage.isValid()) {
         cerr << "Unable to open image: " << inputPath.getPath() << endl;
         return 1;
@@ -211,11 +232,58 @@ int main(int argc, char* argv[]) {
         auto b = extractChannel(sourceImage, 2);
         sourceImage = combineChannels({r, g, b});
     }
+    if (g_grayscale) {
+        sourceImage = extractChannel(sourceImage, 0);
+    }
 
     puts("Generating miplevels...");
     uint32_t count = getMipmapCount(sourceImage);
     vector<LinearImage> miplevels(count);
     generateMipmaps(sourceImage, g_filter, miplevels.data(), count);
+
+    if (g_ktxContainer) {
+        puts("Writing KTX file to disk...");
+        // The libimage API does not include the original image in the mip array,
+        // which might make sense when generating individual files, but for a KTX
+        // bundle, we want to include level 0, so add 1 to the KTX level count.
+        KtxBundle container(1 + miplevels.size(), 1, false);
+        container.info() = {
+            .endianness = KtxBundle::ENDIAN_DEFAULT,
+            .glType = KtxBundle::UNSIGNED_BYTE,
+            .glTypeSize = 3,
+            .glFormat = KtxBundle::RGB,
+            .glInternalFormat = KtxBundle::RGB,
+            .glBaseInternalFormat = KtxBundle::RGB,
+            .pixelWidth = sourceImage.getWidth(),
+            .pixelHeight = sourceImage.getHeight(),
+            .pixelDepth = 0,
+        };
+        if (g_grayscale) {
+            auto& info = container.info();
+            info.glTypeSize = 1;
+            info.glFormat =
+            info.glInternalFormat =
+            info.glBaseInternalFormat = KtxBundle::LUMINANCE;
+        }
+        uint32_t mip = 0;
+        auto delinearize = [&container, &mip](const LinearImage& image) {
+            auto data = g_grayscale ? fromLinearToGrayscale<uint8_t>(image) :
+                fromLinearTosRGB<uint8_t>(image);
+            container.setBlob({mip++, 0, 0}, data.get(),
+                    image.getWidth() * image.getHeight() * container.info().glTypeSize);
+        };
+        delinearize(sourceImage);
+        for (auto image : miplevels) {
+            delinearize(image);
+        }
+        vector<uint8_t> fileContents(container.getSerializedLength());
+        container.serialize(fileContents.data(), fileContents.size());
+        ofstream outputStream(outputPattern, ios::out | ios::binary);
+        outputStream.write((const char*) fileContents.data(), fileContents.size());
+        outputStream.close();
+        puts("Done.");
+        return 0;
+    }
 
     puts("Writing image files to disk...");
     char path[256];
